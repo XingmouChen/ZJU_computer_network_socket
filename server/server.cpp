@@ -6,7 +6,7 @@
 #include <ctime>
 #include <unistd.h>
 
-#include <sys/types.h> 
+#include <sys/unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -15,21 +15,11 @@
 #include <pthread.h>
 
 #include <unordered_map>
+#include <list>
 
 using namespace std;
 
 const int RECV_BUFFER_SIZE = 2048;
-typedef struct thread_attr_t {
-    int id;
-    int sockfd;
-    struct sockaddr_storage client_addr;
-    pthread_t thread;
-} thread_attr_t;
-
-//global variables
-pthread_mutex_t req_list_mtx;
-typedef unordered_map<int, thread_attr_t> req_list_t;
-req_list_t req_table;
 
 void error(const char *msg)
 {
@@ -37,97 +27,258 @@ void error(const char *msg)
     exit(1);
 }
 
-void print_ip_port(int sockfd, struct sockaddr_storage *addr)
-{
+class net_packet {
+public:
+    net_packet(char* _b, int _l):len(_l) {
+        buf = new char(_l);
+        for (int i = 0; i < _l; ++i)
+            buf[i] = _b[i];
+    }
+    ~net_packet() {
+        delete(buf);
+    }
+    int len;
+    char *buf;
+};
+
+class host_list_item {
+public:
+    host_list_item(int _id, int sockfd, struct sockaddr_storage addr) {
+        id = _id;
+        port = -1;
+        bool isIPv4 = true;
+        socklen_t len = sizeof(addr);
+        getpeername(sockfd, (struct sockaddr*)&addr, &len);
+
+        if (addr.ss_family == AF_INET) { //ipv4
+            struct sockaddr_in *s = (struct sockaddr_in *)&addr;
+            port = ntohs(s->sin_port);
+            inet_ntop(AF_INET, &s->sin_addr, ipstr, sizeof(ipstr));
+        }
+        else if (addr.ss_family == AF_INET6){ //ipv6
+            isIPv4 = 0;
+            struct sockaddr_in6 *s = (struct sockaddr_in6 *)&addr;
+            port = ntohs(s->sin6_port);
+            inet_ntop(AF_INET6, &s->sin6_addr, ipstr, sizeof(ipstr));
+        }
+        else {
+            error("print_ip_port() IP family error! ");
+        }
+
+        if (isIPv4) {
+            //printf("Peer IP address type is IPV4 \n");
+        }
+        else {
+            //printf("Peer IP address type is IPV6 \n");
+        }
+    }
+
+    void toStr() {
+        sprintf(item_str, "Host ID: %d\nPort number: %d\nIP addr:%s\n", id, port, ipstr);
+    }
+
+    void print() {
+        printf("%s\n", item_str);
+    }
+
+    int id;
+    int port;
     char ipstr[100];
-    int port = -1;
-    int isIPv4 = 1;
-    socklen_t len = sizeof(*addr);
-    getpeername(sockfd, (struct sockaddr*)addr, &len);
+    char item_str[200];
+};
 
-    if (addr->ss_family == AF_INET) { //ipv4
-        struct sockaddr_in *s = (struct sockaddr_in *)addr;
-        port = ntohs(s->sin_port);
-        inet_ntop(AF_INET, &s->sin_addr, ipstr, sizeof(ipstr));
-    }
-    else if (addr->ss_family == AF_INET6){ //ipv6
-        isIPv4 = 0;
-        struct sockaddr_in6 *s = (struct sockaddr_in6 *)addr;
-        port = ntohs(s->sin6_port);
-        inet_ntop(AF_INET6, &s->sin6_addr, ipstr, sizeof(ipstr));
-    }
-    else {
-        error("print_ip_port() IP family error! ");
-    }
+typedef list<net_packet> packet_list_t;
+typedef struct thread_attr_t {
+    int id;
+    int sockfd;
+    struct sockaddr_storage client_addr;
+    pthread_t recv_thread, send_thread;
+    pthread_mutex_t *send_thrd_mtx;
+    pthread_mutex_t *packet_list_mtx;
+    packet_list_t list;
+} thread_attr_t;
+typedef unordered_map<int, thread_attr_t> req_table_t;
 
-    if (isIPv4) {
-        printf("Peer IP address type is IPV4 \n");
-    }
-    else {
-        printf("Peer IP address type is IPV6 \n");
-    }
-    printf("Peer IP address: %s\n", ipstr);
-    printf("Peer port          : %d\n", port);
-}
+//global variables
+pthread_mutex_t *req_tab_mtx = new pthread_mutex_t;
+req_table_t req_table;
 
-void sendFullMsg(int sockfd, const char* msg, int len) {
+void sendFullMsg(int sockfd, net_packet *p) {
     int n = 0;
     int sended = 0;
-    while (sended < len) {
-        n = send(sockfd, msg + sended, len, 0);
+    while (sended < p->len) {
+        n = send(sockfd, p->buf + sended, p->len, 0);
         if (n < 0)
             error("ERROR writing to socket");
         sended += n;
     }
 }
 
-int talk(int sockfd) {
-    int rtnCode = 1;
-
-    ssize_t n;
+net_packet* get_packet(thread_attr_t *t)
+{
     char recv_buff[RECV_BUFFER_SIZE];
     bzero(recv_buff, RECV_BUFFER_SIZE);
-    n = recv(sockfd, recv_buff, RECV_BUFFER_SIZE, 0);
-    if (n < 0)
-        error("ERROR reading from socket");
+    bool isPacketComplete = false;
+    int len = 0;
+    int packet_len = 0;
+    ssize_t n;
+    do {
+        n = recv(t->sockfd, recv_buff + len, RECV_BUFFER_SIZE, 0);
+        if (n < 0)
+            error("ERROR reading from socket");
+        len += n;
+        if (packet_len == 0) { // the header of a packet
+            char len_str[5];
+            for (int i = 0; i < 4; i++)
+                len_str[i] = recv_buff[i];
+            len_str[5] = '\0';
+            packet_len = atoi(len_str);
+            printf("The packet length is %d\n", packet_len);
+        }
+    } while (len < packet_len);
 
-    printf("Here is the message: %s\n", recv_buff);
-    if (strcmp(recv_buff, "bye()\n") == 0) {
-        rtnCode = 0;
-        sendFullMsg(sockfd, "Got", 3);
-    }
-    else if (strcmp(recv_buff, "getTime()")) {
-        time_t rawtime;
-        struct tm *timeinfo;
-        char buff[80];
-
-        time(&rawtime);
-        timeinfo = localtime(&rawtime);
-
-        strftime(buff, sizeof(buff), "%d-%m-%Y %I:%M:%S", timeinfo);
-        sendFullMsg(sockfd, buff, strlen(buff));
-    }
-
-    return rtnCode;
+    return new net_packet(recv_buff, packet_len);
 }
 
-void* serve_request(void* attr)
+void put_packet(const char *header_code, const char *data_buf, int data_len, thread_attr_t *t)
+{
+    //Construct net_packet's buf
+    int packet_len = 7 + data_len;
+    char *packet_buf = new char(packet_len);
+    sprintf(packet_buf, "%4d%s", packet_len, header_code);
+    memcpy(packet_buf + 7, data_buf, data_len);
+
+    net_packet send_p = net_packet(packet_buf, packet_len);
+    delete(packet_buf);
+    pthread_mutex_lock(t->packet_list_mtx);
+    t->list.push_back(send_p);
+    pthread_mutex_unlock(t->packet_list_mtx);
+}
+
+int do_receive(thread_attr_t *t) {
+    bool isContinue = true;
+    while (isContinue) {
+        net_packet *p = get_packet(t);
+        //now we got a complete packet
+        printf("## Receiv ## Here is the message: %s\n", p->buf);
+
+        //parse packet
+        char req_num = p->buf[4];
+        char ins_num = p->buf[5];
+        char rep_num = p->buf[6];
+        char *data = p->buf + 7;
+        int data_len = p->len - 7;
+
+        if (req_num != '0') {
+            switch (req_num) {
+                case '1': {
+                    isContinue = false;
+                    put_packet("001", NULL, 0, t);
+                }
+                case '2': {
+                    time_t rawtime;
+                    struct tm *timeinfo;
+                    char buff[80];
+
+                    time(&rawtime);
+                    timeinfo = localtime(&rawtime);
+                    strftime(buff, sizeof(buff), "%d-%m-%Y %I:%M:%S", timeinfo);
+                    int msg_len = strlen(buff);
+
+                    put_packet("002", buff, msg_len, t);
+                }
+                case '3': {
+                    char hostname[100];
+                    gethostname(hostname, sizeof(hostname));
+                    int msg_len = strlen(hostname);
+
+                    put_packet("003", hostname, msg_len, t);
+                }
+                case '4': {
+                    char buff[2000];
+                    int msg_len = 0;
+                    pthread_mutex_lock(req_tab_mtx);
+                    for (req_table_t::iterator it = req_table.begin(); it != req_table.end(); ++it) {
+                        host_list_item host(
+                                it->second.id,
+                                it->second.sockfd,
+                                it->second.client_addr
+                        );
+                        int host_len = strlen(host.item_str);
+                        for (int i = 0; i < host_len; ++i)
+                            buff[msg_len + i] = host.item_str[i];
+                        msg_len += host_len;
+                    }
+                    pthread_mutex_unlock(req_tab_mtx);
+
+                    put_packet("004", buff, msg_len, t);
+                }
+                case '5': {
+
+                }
+                case '6': {
+
+                }
+                default:{
+                    error("## Receiv ## Reqeust Number Error!");
+                }
+            }
+        }
+        else{
+            error("## Receiv ## Packet header unkown error!");
+        }
+
+        delete(p);
+    }
+}
+
+void* receive_sock_thread(void* attr)
 {
     thread_attr_t *t = (thread_attr_t *)attr;
 
-    printf("Begin to serve host %d...\n", t->id);
-    print_ip_port(t->sockfd, &(t->client_addr));
+    printf("## Receiv ## Begin to receive_sock host %d...\n", t->id);
+    host_list_item peer(t->id, t->sockfd, t->client_addr);
+    peer.print();
+    do_receive(t);
+    printf("## Receiv ## End to receive_sock host %d...\n", t->id);
 
-    while (talk(t->sockfd));
-    printf("End to serve host %d...\n", t->id);
+    //wait for send_sock() to exit
+    pthread_mutex_lock(t->send_thrd_mtx);
 
     //clean up
-    pthread_mutex_lock(&req_list_mtx);
+    pthread_mutex_lock(req_tab_mtx);
     req_table.erase(t->sockfd);
-    pthread_mutex_unlock(&req_list_mtx);
+    pthread_mutex_unlock(req_tab_mtx);
     close(t->sockfd);
     delete(t);
 
+    pthread_mutex_unlock(t->send_thrd_mtx);
+    pthread_exit(NULL);
+}
+
+void* send_sock_thread(void* attr)
+{
+    thread_attr_t *t = (thread_attr_t *)attr;
+    pthread_mutex_lock(t->send_thrd_mtx);
+
+    printf("## Send ## Begin to send_sock for host %d...\n", t->id);
+    bool isContinue = true;
+    while (isContinue) {
+        sleep(1);
+        pthread_mutex_lock(t->packet_list_mtx);
+        for (packet_list_t::iterator it = t->list.begin(); it != t->list.end(); ++it) {
+            if (it->len < 0) {
+                isContinue = false;
+                break;
+            }
+            sendFullMsg(t->sockfd, &(*it));
+        }
+        t->list.clear();
+        pthread_mutex_unlock(t->packet_list_mtx);
+    }
+    printf("## Send ## End to send_sock host %d...\n", t->id);
+
+    pthread_mutex_unlock(t->send_thrd_mtx);
     pthread_exit(NULL);
 }
 
@@ -178,7 +329,7 @@ int main(int argc, char *argv[])
     socklen_t client_addr_size;
     int sockfd_new;
     int request_count = 0;
-    pthread_mutex_init(&req_list_mtx, NULL);
+    pthread_mutex_init(req_tab_mtx, NULL);
 
     while (true) {
         sockfd_new = accept(sockfd, (struct sockaddr*)&client_addr, &client_addr_size);
@@ -187,20 +338,28 @@ int main(int argc, char *argv[])
         attr->id = request_count++;
         attr->sockfd = sockfd_new;
         attr->client_addr = client_addr;
+        pthread_mutex_init(attr->send_thrd_mtx, NULL);
+        pthread_mutex_init(attr->packet_list_mtx, NULL);
 
-        pthread_mutex_lock(&req_list_mtx);
+        pthread_mutex_lock(req_tab_mtx);
         req_table.insert(make_pair(attr->sockfd, *attr));
-        pthread_mutex_unlock(&req_list_mtx);
+        pthread_mutex_unlock(req_tab_mtx);
 
         pthread_create(
-                &attr->thread,
+                &attr->recv_thread,
                 NULL,
-                serve_request,
+                receive_sock_thread,
+                (void*)attr
+        );
+        pthread_create(
+                &attr->send_thread,
+                NULL,
+                send_sock_thread,
                 (void*)attr
         );
     }
 
-    pthread_mutex_destroy(&req_list_mtx);
+    pthread_mutex_destroy(req_tab_mtx);
     close(sockfd);
     close(sockfd_new);
 
