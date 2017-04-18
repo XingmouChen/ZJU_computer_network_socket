@@ -48,7 +48,7 @@ public:
     net_packet(char* _b, int _l):len(_l) {
         char str[len + 1];
         memcpy(str, _b, len);
-        str[len + 1] = '\0';
+        str[len] = '\0';
         msg = string(str);
     }
     int len;
@@ -108,13 +108,33 @@ typedef list<net_packet> packet_list_t;
 typedef struct thread_attr_t {
     int id;
     int sockfd;
+    bool isOnline;
     struct sockaddr_storage client_addr;
-    pthread_t recv_thread, send_thread;
+    pthread_t thread;
     pthread_mutex_t *send_thrd_mtx;
     pthread_mutex_t *packet_list_mtx;
     packet_list_t list;
 } thread_attr_t;
-typedef unordered_map<int, thread_attr_t> req_table_t;
+
+class req_table_item {
+public:
+    req_table_item() = default;
+    req_table_item(
+            int _id,
+            int _socketfd,
+            struct sockaddr_storage _clientaddr,
+            thread_attr_t *_attr
+    ):
+            id(_id), sockfd(_socketfd), client_addr(_clientaddr), attr(_attr)
+    {}
+
+    int id;
+    int sockfd;
+    struct sockaddr_storage client_addr;
+    thread_attr_t *attr;
+};
+
+typedef unordered_map<int, req_table_item> req_table_t;
 
 //global variables
 pthread_mutex_t *req_tab_mtx = new pthread_mutex_t;
@@ -170,13 +190,10 @@ void put_packet(const char *header_code, const char *data_buf, int data_len, thr
     memcpy(packet_buf + 7, data_buf, data_len);
 
     net_packet send_p = net_packet(packet_buf, packet_len);
-    cout << "net_packet len == " << send_p.len << endl;
-    cout << "net_packet msg == " << send_p.msg << endl;
+    cout << "put_packet msg == " << send_p.msg << endl;
     pthread_mutex_lock(t->packet_list_mtx);
     t->list.push_back(send_p);
     pthread_mutex_unlock(t->packet_list_mtx);
-    cout << "net_packet len == " << t->list.back().len << endl;
-    cout << "net_packet msg == " << t->list.back().msg << endl;
 }
 
 int do_receive(thread_attr_t *t) {
@@ -197,7 +214,8 @@ int do_receive(thread_attr_t *t) {
             switch (req_num) {
                 case '1': {
                     isContinue = false;
-                    put_packet("001", NULL, 0, t);
+                    t->isOnline = false;
+                    put_packet("001", "Bye~", 4, t);
 
                     break;
                 }
@@ -251,6 +269,22 @@ int do_receive(thread_attr_t *t) {
                     break;
                 }
                 case '5': {
+                    char host_id_str[5];
+                    host_id_str[4] = 0;
+                    for (int i = 0; i < 4; ++i)
+                        host_id_str[i] = data[i];
+                    int hostId = atoi(host_id_str);
+                    cout << "The target msg host id == " << hostId << endl;
+
+                    pthread_mutex_lock(req_tab_mtx);
+                    if (req_table.count(hostId) == 1) {
+                        put_packet("005", NULL, 0, t);
+                        put_packet("010", data, data_len, req_table[hostId].attr);
+                    }
+                    else {
+                        put_packet("006", "0001HOST NOT FOUND", 18, t);
+                    }
+                    pthread_mutex_unlock(req_tab_mtx);
 
                     break;
                 }
@@ -287,7 +321,7 @@ void* receive_sock_thread(void* attr)
 
     //clean up
     pthread_mutex_lock(req_tab_mtx);
-    req_table.erase(t->sockfd);
+    req_table.erase(t->id);
     pthread_mutex_unlock(req_tab_mtx);
     close(t->sockfd);
     delete(t);
@@ -307,20 +341,20 @@ void* send_sock_thread(void* attr)
         sleep(1);
 //        printf("## Send ## WAKE UP!\n");
         pthread_mutex_lock(t->packet_list_mtx);
-        for (packet_list_t::iterator it = t->list.begin(); it != t->list.end(); ++it) {
-            if (it->len < 0) {
-                isContinue = false;
-                break;
-            }
-            printf("it->len == %d\n", it->len);
+        for (packet_list_t::iterator it = t->list.begin(); isContinue && it != t->list.end(); ++it) {
             sendFullMsg(t->sockfd, &(*it));
         }
         t->list.clear();
         pthread_mutex_unlock(t->packet_list_mtx);
+
+        if (!t->isOnline) {
+            isContinue = false;
+        }
     }
     printf("## Send ## End to send_sock host %d...\n", t->id);
 
     pthread_mutex_unlock(t->send_thrd_mtx);
+
     pthread_exit(NULL);
 }
 
@@ -377,6 +411,7 @@ int main(int argc, char *argv[])
         sockfd_new = accept(sockfd, (struct sockaddr*)&client_addr, &client_addr_size);
 
         thread_attr_t *attr = new thread_attr_t;
+        attr->isOnline = true;
         attr->id = request_count++;
         attr->sockfd = sockfd_new;
         attr->client_addr = client_addr;
@@ -386,17 +421,20 @@ int main(int argc, char *argv[])
         pthread_mutex_init(attr->packet_list_mtx, NULL);
 
         pthread_mutex_lock(req_tab_mtx);
-        req_table.insert(make_pair(attr->sockfd, *attr));
+        req_table.insert(make_pair(
+                attr->id,
+                req_table_item(attr->id, attr->sockfd, attr->client_addr, attr)
+        ));
         pthread_mutex_unlock(req_tab_mtx);
 
         pthread_create(
-                &attr->recv_thread,
+                &attr->thread,
                 NULL,
                 receive_sock_thread,
                 (void*)attr
         );
         pthread_create(
-                &attr->send_thread,
+                &attr->thread,
                 NULL,
                 send_sock_thread,
                 (void*)attr
