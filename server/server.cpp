@@ -14,8 +14,10 @@
 
 #include <pthread.h>
 
+#include <iostream>
 #include <unordered_map>
 #include <list>
+#include <string>
 
 using namespace std;
 
@@ -27,18 +29,31 @@ void error(const char *msg)
     exit(1);
 }
 
+//rule of 5 7
 class net_packet {
 public:
+//    net_packet(char* _b, int _l):len(_l) {
+//        buf = new char(_l);
+//        for (int i = 0; i < _l; ++i)
+//            buf[i] = _b[i];
+//    }
+//    net_packet(const net_packet& p):len(p.len) {
+//        buf = new char(p.len);
+//        for (int i = 0; i < p.len; ++i)
+//            buf[i] = p.buf[i];
+//    }
+//    ~net_packet() {
+//        delete(buf);
+//    }
     net_packet(char* _b, int _l):len(_l) {
-        buf = new char(_l);
-        for (int i = 0; i < _l; ++i)
-            buf[i] = _b[i];
-    }
-    ~net_packet() {
-        delete(buf);
+        char str[len + 1];
+        memcpy(str, _b, len);
+        str[len + 1] = '\0';
+        msg = string(str);
     }
     int len;
-    char *buf;
+    string msg;
+    //char *buf;
 };
 
 class host_list_item {
@@ -71,6 +86,8 @@ public:
         else {
             //printf("Peer IP address type is IPV6 \n");
         }
+
+        toStr();
     }
 
     void toStr() {
@@ -78,7 +95,7 @@ public:
     }
 
     void print() {
-        printf("%s\n", item_str);
+        printf("## host item print ##\n%s\n", item_str);
     }
 
     int id;
@@ -104,14 +121,18 @@ pthread_mutex_t *req_tab_mtx = new pthread_mutex_t;
 req_table_t req_table;
 
 void sendFullMsg(int sockfd, net_packet *p) {
+    printf("## sendFullMsg: ##\n");
+    cout << p->msg << endl;
+    printf("## sendFullMsg: ##\n");
     int n = 0;
     int sended = 0;
     while (sended < p->len) {
-        n = send(sockfd, p->buf + sended, p->len, 0);
+        n = send(sockfd, p->msg.c_str() + sended, p->len, 0);
         if (n < 0)
             error("ERROR writing to socket");
         sended += n;
     }
+    printf("## sendFullMsg END: ##\n");
 }
 
 net_packet* get_packet(thread_attr_t *t)
@@ -144,15 +165,18 @@ void put_packet(const char *header_code, const char *data_buf, int data_len, thr
 {
     //Construct net_packet's buf
     int packet_len = 7 + data_len;
-    char *packet_buf = new char(packet_len);
-    sprintf(packet_buf, "%4d%s", packet_len, header_code);
+    char packet_buf[packet_len + 1];
+    sprintf(packet_buf, "%04d%s", packet_len, header_code);
     memcpy(packet_buf + 7, data_buf, data_len);
 
     net_packet send_p = net_packet(packet_buf, packet_len);
-    delete(packet_buf);
+    cout << "net_packet len == " << send_p.len << endl;
+    cout << "net_packet msg == " << send_p.msg << endl;
     pthread_mutex_lock(t->packet_list_mtx);
     t->list.push_back(send_p);
     pthread_mutex_unlock(t->packet_list_mtx);
+    cout << "net_packet len == " << t->list.back().len << endl;
+    cout << "net_packet msg == " << t->list.back().msg << endl;
 }
 
 int do_receive(thread_attr_t *t) {
@@ -160,13 +184,13 @@ int do_receive(thread_attr_t *t) {
     while (isContinue) {
         net_packet *p = get_packet(t);
         //now we got a complete packet
-        printf("## Receiv ## Here is the message: %s\n", p->buf);
+        cout << "## Receiv ## Here is the message: " << p->msg << endl;
 
         //parse packet
-        char req_num = p->buf[4];
-        char ins_num = p->buf[5];
-        char rep_num = p->buf[6];
-        char *data = p->buf + 7;
+        char req_num = p->msg[4];
+        char ins_num = p->msg[5];
+        char rep_num = p->msg[6];
+        const char *data = p->msg.c_str() + 7;
         int data_len = p->len - 7;
 
         if (req_num != '0') {
@@ -174,8 +198,11 @@ int do_receive(thread_attr_t *t) {
                 case '1': {
                     isContinue = false;
                     put_packet("001", NULL, 0, t);
+
+                    break;
                 }
                 case '2': {
+                    printf("DATE BEGIN!\n");
                     time_t rawtime;
                     struct tm *timeinfo;
                     char buff[80];
@@ -183,16 +210,24 @@ int do_receive(thread_attr_t *t) {
                     time(&rawtime);
                     timeinfo = localtime(&rawtime);
                     strftime(buff, sizeof(buff), "%d-%m-%Y %I:%M:%S", timeinfo);
+                    printf("time: %s\n", buff);
                     int msg_len = strlen(buff);
+                    printf("msg_len: %d\n", msg_len);
 
                     put_packet("002", buff, msg_len, t);
+                    printf("DATE END!\n");
+
+                    break;
                 }
                 case '3': {
                     char hostname[100];
                     gethostname(hostname, sizeof(hostname));
                     int msg_len = strlen(hostname);
 
+                    printf("hostname %s\n", hostname);
                     put_packet("003", hostname, msg_len, t);
+
+                    break;
                 }
                 case '4': {
                     char buff[2000];
@@ -212,22 +247,27 @@ int do_receive(thread_attr_t *t) {
                     pthread_mutex_unlock(req_tab_mtx);
 
                     put_packet("004", buff, msg_len, t);
+
+                    break;
                 }
                 case '5': {
 
+                    break;
                 }
                 case '6': {
 
+                    break;
                 }
                 default:{
                     error("## Receiv ## Reqeust Number Error!");
+
+                    break;
                 }
             }
         }
         else{
             error("## Receiv ## Packet header unkown error!");
         }
-
         delete(p);
     }
 }
@@ -265,12 +305,14 @@ void* send_sock_thread(void* attr)
     bool isContinue = true;
     while (isContinue) {
         sleep(1);
+//        printf("## Send ## WAKE UP!\n");
         pthread_mutex_lock(t->packet_list_mtx);
         for (packet_list_t::iterator it = t->list.begin(); it != t->list.end(); ++it) {
             if (it->len < 0) {
                 isContinue = false;
                 break;
             }
+            printf("it->len == %d\n", it->len);
             sendFullMsg(t->sockfd, &(*it));
         }
         t->list.clear();
@@ -338,6 +380,8 @@ int main(int argc, char *argv[])
         attr->id = request_count++;
         attr->sockfd = sockfd_new;
         attr->client_addr = client_addr;
+        attr->send_thrd_mtx = new pthread_mutex_t;
+        attr->packet_list_mtx = new pthread_mutex_t;
         pthread_mutex_init(attr->send_thrd_mtx, NULL);
         pthread_mutex_init(attr->packet_list_mtx, NULL);
 
