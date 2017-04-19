@@ -140,7 +140,8 @@ typedef unordered_map<int, req_table_item> req_table_t;
 pthread_mutex_t *req_tab_mtx = new pthread_mutex_t;
 req_table_t req_table;
 
-void sendFullMsg(int sockfd, net_packet *p) {
+void sendFullMsg(int sockfd, net_packet *p)
+{
     printf("## sendFullMsg: ##\n");
     cout << p->msg << endl;
     printf("## sendFullMsg: ##\n");
@@ -155,6 +156,14 @@ void sendFullMsg(int sockfd, net_packet *p) {
     printf("## sendFullMsg END: ##\n");
 }
 
+int parse_number(const char* buf, int len) {
+    char str[len + 1];
+    str[len] = '\0';
+    for (int i = 0; i < len; i++)
+        str[i] = buf[i];
+    return atoi(str);
+}
+
 net_packet* get_packet(thread_attr_t *t)
 {
     char recv_buff[RECV_BUFFER_SIZE];
@@ -167,13 +176,15 @@ net_packet* get_packet(thread_attr_t *t)
         n = recv(t->sockfd, recv_buff + len, RECV_BUFFER_SIZE, 0);
         if (n < 0)
             error("ERROR reading from socket");
+
+        //socket offline
+        if (n == 0) {
+            return nullptr;
+        }
+
         len += n;
         if (packet_len == 0) { // the header of a packet
-            char len_str[5];
-            for (int i = 0; i < 4; i++)
-                len_str[i] = recv_buff[i];
-            len_str[5] = '\0';
-            packet_len = atoi(len_str);
+            packet_len = parse_number(recv_buff, 4);
             printf("The packet length is %d\n", packet_len);
         }
     } while (len < packet_len);
@@ -200,6 +211,13 @@ int do_receive(thread_attr_t *t) {
     bool isContinue = true;
     while (isContinue) {
         net_packet *p = get_packet(t);
+
+        //socket offline
+        if (p == nullptr) {
+            cout << "Host " << t->id << " offline!" << endl;
+            isContinue = false;
+            break;
+        }
         //now we got a complete packet
         cout << "## Receiv ## Here is the message: " << p->msg << endl;
 
@@ -273,13 +291,19 @@ int do_receive(thread_attr_t *t) {
                     host_id_str[4] = 0;
                     for (int i = 0; i < 4; ++i)
                         host_id_str[i] = data[i];
-                    int hostId = atoi(host_id_str);
+                    int hostId = parse_number(data, 4);
+                    data += 4;
                     cout << "The target msg host id == " << hostId << endl;
 
                     pthread_mutex_lock(req_tab_mtx);
                     if (req_table.count(hostId) == 1) {
                         put_packet("005", NULL, 0, t);
-                        put_packet("010", data, data_len, req_table[hostId].attr);
+                        char *msg = new char[4 + data_len];
+                        sprintf(msg, "%04d", t->id);
+                        for (int i = 0; i < data_len; ++i)
+                            msg[i + 4] = data[i];
+                        put_packet("010", msg, 4 + data_len, req_table[hostId].attr);
+                        delete msg;
                     }
                     else {
                         put_packet("006", "0001HOST NOT FOUND", 18, t);
@@ -289,6 +313,10 @@ int do_receive(thread_attr_t *t) {
                     break;
                 }
                 case '6': {
+                    int hostId = parse_number(data, 4);
+                    pthread_mutex_lock(req_tab_mtx);
+                    put_packet("020", NULL, 0, req_table[hostId].attr);
+                    pthread_mutex_unlock(req_tab_mtx);
 
                     break;
                 }
