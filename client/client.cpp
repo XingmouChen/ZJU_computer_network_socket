@@ -29,14 +29,21 @@ int getUserInput(int sockfd)
 
     int n;
     //Notice! the send may not send all of the contents, you should check the n for sure!
-    n = send(sockfd, buffer, strlen(buffer), 0);
-    if (n < 0) 
-         error("ERROR writing to socket");
+    //exclude the trailing '\n'
+    for (int i = 0; i < 20; ++i) {
+        n = send(sockfd, buffer, strlen(buffer) - 1, 0);
+        if (n < 0)
+            error("ERROR writing to socket");
+    }
+
     bzero(buffer, 256);
-    n = recv(sockfd, buffer, 255, 0);
-    if (n < 0) 
-         error("ERROR reading from socket");
-    printf("%s\n",buffer);
+
+    for (int i = 0; i < 20; ++i) {
+        n = recv(sockfd, buffer, 255, 0);
+        if (n < 0)
+            error("ERROR reading from socket");
+        printf("%s\n", buffer);
+    }
 
     return rtnCode;
 }

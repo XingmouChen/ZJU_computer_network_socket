@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <ctime>
+#include <signal.h>
 #include <unistd.h>
 
 #include <sys/unistd.h>
@@ -45,7 +46,7 @@ public:
 //    ~net_packet() {
 //        delete(buf);
 //    }
-    net_packet(char* _b, int _l):len(_l) {
+    net_packet(const char* _b, int _l):len(_l) {
         char str[len + 1];
         memcpy(str, _b, len);
         str[len] = '\0';
@@ -166,14 +167,24 @@ int parse_number(const char* buf, int len) {
 
 net_packet* get_packet(thread_attr_t *t)
 {
+    static string recv_str;
+
+    //If there are still completely received packets, return one directly
+    if (recv_str.length() > 0) {
+        cout << "## The recv_str is (length() > 0)" << recv_str << endl;
+        int packet_len = parse_number(recv_str.c_str(), 4);
+        net_packet *p = new net_packet(recv_str.c_str(), packet_len);
+        recv_str = recv_str.substr(packet_len, recv_str.length() - packet_len);
+        return p;
+    }
+
+    //else receive at least one complete packet
     char recv_buff[RECV_BUFFER_SIZE];
     bzero(recv_buff, RECV_BUFFER_SIZE);
-    bool isPacketComplete = false;
-    int len = 0;
     int packet_len = 0;
     ssize_t n;
     do {
-        n = recv(t->sockfd, recv_buff + len, RECV_BUFFER_SIZE, 0);
+        n = recv(t->sockfd, recv_buff, RECV_BUFFER_SIZE, 0);
         if (n < 0)
             error("ERROR reading from socket");
 
@@ -182,14 +193,16 @@ net_packet* get_packet(thread_attr_t *t)
             return nullptr;
         }
 
-        len += n;
-        if (packet_len == 0) { // the header of a packet
-            packet_len = parse_number(recv_buff, 4);
-            printf("The packet length is %d\n", packet_len);
-        }
-    } while (len < packet_len);
+        //cout << "n == " << n << endl;
+        //recv_buff[n] = '\0';
+        recv_str += string(recv_buff);
+        packet_len = parse_number(recv_str.c_str(), 4);
+    } while (recv_str.length() < packet_len);
 
-    return new net_packet(recv_buff, packet_len);
+    cout << "## The recv_str is " << recv_str << endl;
+    net_packet *p = new net_packet(recv_str.c_str(), packet_len);
+    recv_str = recv_str.substr(packet_len, recv_str.length() - packet_len);
+    return p;
 }
 
 void put_packet(const char *header_code, const char *data_buf, int data_len, thread_attr_t *t)
@@ -238,7 +251,6 @@ int do_receive(thread_attr_t *t) {
                     break;
                 }
                 case '2': {
-                    printf("DATE BEGIN!\n");
                     time_t rawtime;
                     struct tm *timeinfo;
                     char buff[80];
@@ -251,7 +263,6 @@ int do_receive(thread_attr_t *t) {
                     printf("msg_len: %d\n", msg_len);
 
                     put_packet("002", buff, msg_len, t);
-                    printf("DATE END!\n");
 
                     break;
                 }
@@ -338,7 +349,6 @@ void* receive_sock_thread(void* attr)
 {
     thread_attr_t *t = (thread_attr_t *)attr;
 
-    printf("## Receiv ## Begin to receive_sock host %d...\n", t->id);
     host_list_item peer(t->id, t->sockfd, t->client_addr);
     peer.print();
     do_receive(t);
@@ -363,7 +373,6 @@ void* send_sock_thread(void* attr)
     thread_attr_t *t = (thread_attr_t *)attr;
     pthread_mutex_lock(t->send_thrd_mtx);
 
-    printf("## Send ## Begin to send_sock for host %d...\n", t->id);
     bool isContinue = true;
     while (isContinue) {
         sleep(1);
@@ -399,7 +408,6 @@ int main(int argc, char *argv[])
     gethostname(hostname, sizeof(hostname));
     printf("My hostname is : %s\n", hostname);
 
-    //
     struct addrinfo hints;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
